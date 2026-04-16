@@ -55,6 +55,21 @@ def open_text_file(path):
     return open(path, "r", encoding="utf-8")
 
 
+def _scalar_str(value):
+    """Coerce pandas/numpy cell values to a clean string."""
+    if value is None:
+        return ""
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    s = str(value).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
 def normalize_record(record):
     abstract = (
         record.get("abstract")
@@ -67,11 +82,24 @@ def normalize_record(record):
         or record.get("Title")
         or ""
     ).strip()
-    source_url = (
+
+    # HF parquet (e.g. permutans/arxiv-papers-by-subject) has arxiv_id, not id/link
+    explicit_raw = (
         record.get("link")
         or record.get("source_url")
-        or (f"https://arxiv.org/abs/{record.get('id')}" if record.get("id") else "")
-    ).strip()
+        or record.get("url")
+    )
+    source_url = _scalar_str(explicit_raw)
+    if not source_url:
+        paper_id = _scalar_str(
+            record.get("arxiv_id")
+            or record.get("id")
+            or record.get("paper_id")
+        )
+        if paper_id:
+            source_url = f"https://arxiv.org/abs/{paper_id}"
+        else:
+            source_url = _scalar_str(record.get("doi"))
 
     if not abstract or not title:
         return None
@@ -177,6 +205,14 @@ def collection_exists(client, collection_name: str) -> bool:
     return collection_name in {collection.name for collection in collections}
 
 
+def get_collection_count(client, collection_name: str) -> int:
+    try:
+        response = client.count(collection_name=collection_name)
+        return int(response.count)
+    except Exception:
+        return 0
+
+
 def reset_collection(client, vector_size):
     collections = client.get_collections().collections
     collection_names = [collection.name for collection in collections]
@@ -197,9 +233,15 @@ def main():
     qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
     client = QdrantClient(host=qdrant_host, port=qdrant_port)
 
-    if collection_exists(client, COLLECTION_NAME):
-        print(f"Collection '{COLLECTION_NAME}' already exists, deleting it before ingest.")
-        client.delete_collection(collection_name=COLLECTION_NAME)
+    collection_exists_flag = collection_exists(client, COLLECTION_NAME)
+    if collection_exists_flag:
+        existing_count = get_collection_count(client, COLLECTION_NAME)
+        print(f"Collection '{COLLECTION_NAME}' already exists with {existing_count} entries.")
+        if existing_count >= args.limit:
+            print(f"Database already has {existing_count} entries, skipping ingestion.")
+            return
+    else:
+        existing_count = 0
 
     if dataset_path and os.path.exists(dataset_path):
         source_path = dataset_path
@@ -224,7 +266,10 @@ def main():
     client = QdrantClient(host=qdrant_host, port=qdrant_port)
 
     first_vector = model.encode(documents[0]["text"]).tolist()
-    reset_collection(client, len(first_vector))
+    if not collection_exists_flag:
+        reset_collection(client, len(first_vector))
+    else:
+        print(f"Appending documents to existing collection '{COLLECTION_NAME}'.")
 
     first_point = PointStruct(
         id=str(uuid.uuid4()),

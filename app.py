@@ -1,15 +1,5 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct, Filter, FieldCondition, MatchValue
-from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from PyPDF2 import PdfReader
-from sklearn.cluster import KMeans
+import os
 import uuid, datetime
-from qdrant_client.http.models import Distance, VectorParams
-from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 from typing import List
 import json
@@ -19,9 +9,23 @@ import threading
 import httpx
 import asyncio
 
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import PointStruct, Filter, FieldCondition, MatchValue
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from PyPDF2 import PdfReader
+from sklearn.cluster import KMeans
+from qdrant_client.http.models import Distance, VectorParams
+from fastapi.responses import StreamingResponse
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 app = FastAPI()
 app.add_middleware(
@@ -50,15 +54,21 @@ class EmbeddingModelSingleton:
                 if self._model is None:
                     logger.info("Loading embedding model...")
                     start_time = time.time()
-                    self._model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+                    self._model = SentenceTransformer(EMBEDDING_MODEL)
                     load_time = time.time() - start_time
                     logger.info(f"Embedding model loaded in {load_time:.2f}s")
         return self._model
 
 # Initialize services
 embedding_service = EmbeddingModelSingleton()
-qdrant = QdrantClient(host="qdrant", port=6333)
-COLLECTION_NAME = "RAG-3.0"
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "localhost")
+OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
+PDF_COLLECTION_NAME = "RAG-3.0"
+ARXIV_COLLECTION_NAME = "arxiv_abstracts"
+UPLOADED_FILES_COLLECTION_NAME = "uploaded_files"
+qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 class QueryRequest(BaseModel):
     question: str
@@ -66,6 +76,36 @@ class QueryRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     filenames: List[str]
+
+
+def ensure_collection(collection_name: str, vector_size: int) -> None:
+    collections = qdrant.get_collections().collections
+    collection_names = [col.name for col in collections]
+    if collection_name not in collection_names:
+        qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=vector_size,
+                distance=Distance.COSINE
+            )
+        )
+
+
+def build_sources(hits):
+    return [
+        {
+            "title": hit.payload.get("title") or hit.payload.get("filename", "Untitled"),
+            "url": hit.payload.get("link") or hit.payload.get("source_url", ""),
+            "passage": hit.payload.get("text", "")
+        }
+        for hit in hits
+    ]
+
+
+def collection_exists(collection_name: str) -> bool:
+    collections = qdrant.get_collections().collections
+    return collection_name in {col.name for col in collections}
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -80,7 +120,6 @@ async def startup_event():
         # Test Qdrant connection
         collections = qdrant.get_collections()
         logger.info(f"Qdrant connected, found {len(collections.collections)} collections")
-        
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -139,25 +178,18 @@ async def upload_file(file: UploadFile = File(...)):
         # Create collections if needed
         collections = qdrant.get_collections().collections
         collection_names = [col.name for col in collections]
-        
-        if COLLECTION_NAME not in collection_names:
-            qdrant.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(
-                size=len(embeddings[0]),
-                distance=Distance.COSINE
-                )   
-            )  
+
+        ensure_collection(PDF_COLLECTION_NAME, len(embeddings[0]))
         
         qdrant.upsert(
-            collection_name=COLLECTION_NAME,
+            collection_name=PDF_COLLECTION_NAME,
             points=points
         )
         
         # Handle uploaded_files collection
-        if "uploaded_files" not in collection_names:
+        if UPLOADED_FILES_COLLECTION_NAME not in collection_names:
             qdrant.create_collection(
-                collection_name="uploaded_files",
+                collection_name=UPLOADED_FILES_COLLECTION_NAME,
                 vectors_config=VectorParams(
                 size=10,
                 distance=Distance.COSINE
@@ -165,7 +197,7 @@ async def upload_file(file: UploadFile = File(...)):
             )
         
         qdrant.upsert(
-        collection_name="uploaded_files",
+        collection_name=UPLOADED_FILES_COLLECTION_NAME,
         points=[
             PointStruct(
                 id=uuid.uuid4().int >> 64,
@@ -212,7 +244,9 @@ async def query_rag_stream(req: QueryRequest):
             return
 
         filters = None
+        collection_name = ARXIV_COLLECTION_NAME
         if req.filenames:
+            collection_name = PDF_COLLECTION_NAME
             filters = Filter(
                 should=[
                     FieldCondition(
@@ -223,10 +257,15 @@ async def query_rag_stream(req: QueryRequest):
                 ]
             )
 
+        if not collection_exists(collection_name):
+            logger.error(f"Qdrant collection not found: {collection_name}")
+            yield "data: " + json.dumps({"error": f"⚠️ Qdrant collection '{collection_name}' not found. Please preload the database with ingest_arxiv.py."}) + "\n\n"
+            return
+
         # Qdrant search
         try:
             hits = qdrant.search(
-                collection_name=COLLECTION_NAME,
+                collection_name=collection_name,
                 query_vector=query_vector,
                 limit=3,
                 query_filter=filters
@@ -238,8 +277,11 @@ async def query_rag_stream(req: QueryRequest):
             return
 
         if not hits:
-            yield "data: " + json.dumps({"error": "⚠️ No context found. Please upload a document first."}) + "\n\n"
+            yield "data: " + json.dumps({"error": "⚠️ No context found for this question."}) + "\n\n"
             return
+
+        sources = build_sources(hits)
+        yield "data: " + json.dumps({"sources": sources}) + "\n\n"
 
         context = "\n\n".join([hit.payload["text"] for hit in hits])
         prompt = f"Answer the question using only the context.\n\nContext:\n{context}\n\nQuestion:\n{question}\nAnswer:"
@@ -251,7 +293,7 @@ async def query_rag_stream(req: QueryRequest):
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream(
                     "POST",
-                    "http://ollama:11434/api/generate",
+                    f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate",
                     json={
                         "model": "phi3:3.8b-mini-128k-instruct-q4_0",
                         "prompt": prompt,
@@ -270,7 +312,7 @@ async def query_rag_stream(req: QueryRequest):
                                     await asyncio.sleep(0.01)  # helps flushing
 
                                 if chunk.get("done"):
-                                    yield "data: " + json.dumps({"done": True}) + "\n\n"
+                                    yield "data: " + json.dumps({"done": True, "sources": sources}) + "\n\n"
                                     break
                             except Exception as e:
                                 logger.error(f"Chunk parse error: {e}")
@@ -292,8 +334,12 @@ async def query_rag_stream(req: QueryRequest):
 @app.get("/files")
 def list_files():
     try:
+        collections = qdrant.get_collections().collections
+        collection_names = [col.name for col in collections]
+        if UPLOADED_FILES_COLLECTION_NAME not in collection_names:
+            return {"files": []}
         scroll = qdrant.scroll(
-            collection_name="uploaded_files",
+            collection_name=UPLOADED_FILES_COLLECTION_NAME,
             limit=1000,
             with_payload=True
         )
@@ -312,7 +358,7 @@ def delete_file(req: DeleteRequest):
     try:
         # Delete file vectors
         qdrant.delete(
-            collection_name=COLLECTION_NAME,
+            collection_name=PDF_COLLECTION_NAME,
             points_selector=Filter(
                 should=[
                     FieldCondition(
@@ -325,7 +371,7 @@ def delete_file(req: DeleteRequest):
         )
         # Delete file index
         qdrant.delete(
-            collection_name="uploaded_files",
+            collection_name=UPLOADED_FILES_COLLECTION_NAME,
             points_selector=Filter(
                 should=[
                     FieldCondition(

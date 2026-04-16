@@ -1,17 +1,22 @@
-# Ignore virtual environment and caches
-venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
 
-# IDE/workspace settings
-*.code-workspace
-.vscode/
+# Environment
+.env
+.env.*
 
-# OS files
+# OS
 .DS_Store
 
-# Python dotenv
-.env
+# Large / generated data & model cache (see scripts/download_data.py, docker-compose)
+hf_cache/
+data/arxiv_raw/
+data/arxiv-dataset.json
 
-# Ollama cache
-/root/.ollama
+# IDE
+.idea/
+.vscode/
+*.code-workspace

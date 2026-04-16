@@ -37,8 +37,15 @@ services:
       - ollama
     command: >
       sh -c "
-      python scripts/download_data.py &&
-      python scripts/ingest_arxiv.py data/arxiv-dataset.json &&
+      (
+        if [ ! -d data/arxiv_raw ] || [ \"$(find data/arxiv_raw -type f | wc -l)\" -eq 0 ]; then
+          echo 'Raw data missing or empty, running download_data.py'
+          python scripts/download_data.py
+        else
+          echo 'Raw data already exists, skipping download_data.py'
+        fi
+        python scripts/ingest_arxiv.py data/arxiv-dataset.json
+      ) &
       uvicorn app:app --host 0.0.0.0 --port 8000 &
       streamlit run ui.py --server.port 8501 --server.address 0.0.0.0
       "

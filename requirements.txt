@@ -14,7 +14,9 @@ huggingface-hub
 PyPDF2==3.0.1
 
 # === Vector DB ===
-qdrant-client>=1.12.0
+# Pin 1.11.x: Qdrant server in docker-compose is v1.7.x; `search()` works. Newer clients drop `search`
+# and use APIs that require a newer Qdrant server (otherwise queries 404).
+qdrant-client>=1.11.0,<1.12.0
 
 # === Chunking ===
 langchain==0.1.14

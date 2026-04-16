@@ -1,5 +1,3 @@
-<img width="1710" height="982" alt="RAG-3.0" src="https://github.com/user-attachments/assets/e2f0e5bd-d621-4a93-ac6d-d2064a3f379c" />
-
 # 🧠 Local RAG App with Qdrant + Ollama
 <div align="center">
 
@@ -17,7 +15,7 @@
 </div>
 
 
-> **🚀 Zero-Config Setup**: Just run `docker-compose up --build` - No Python, No Ollama installation, No model downloads, No configuration files needed!
+> **🚀 Minimal setup**: The `rag-app` container downloads raw data, samples it, and ingests it into Qdrant before starting the app.
 
 A fully local, end-to-end Retrieval-Augmented Generation (RAG) system built with:
 - 🧠 **FastAPI** – backend API server
@@ -25,6 +23,10 @@ A fully local, end-to-end Retrieval-Augmented Generation (RAG) system built with
 - 🔍 **Qdrant** – high-performance vector database
 - 🤖 **Ollama** – run LLMs like Phi3/Mistral etc locally
 - 📄 **PDF Support** – upload documents and ask questions
+
+This project is configured so that the `rag-app` service will run `python scripts/download_data.py` and then `python scripts/ingest_arxiv.py` before starting FastAPI and Streamlit.
+If the `arxiv_abstracts` collection already exists, ingestion is skipped automatically.
+The Qdrant volume `qdrant_data:/qdrant/storage` persists the ingested data, so subsequent restarts can query the existing dataset directly.
 
 ---
 
@@ -47,10 +49,10 @@ A fully local, end-to-end Retrieval-Augmented Generation (RAG) system built with
 | Download Ollama separately | ✅ Auto-installed |
 | Pull models manually | ✅ Auto-downloaded |
 | Configure embeddings | ✅ Pre-configured |
-| Set up vector database | ✅ Ready to use |
-| **Result: Hours of setup** | **Result: One command** |
+| Set up vector database | ✅ Persistent Qdrant volume |
+| **Result: Hours of setup** | **Result: Container-run download + ingest + startup** |
 
-**Just run:** `docker-compose up --build` **and you're done!** 🎉
+**Run `docker compose up --build`** to let the container download raw data, sample the dataset, ingest Qdrant, and start the app. 🎉
 
 ---
 
@@ -76,17 +78,32 @@ git clone https://github.com/noorjotk/local-rag-engine.git
 cd local-rag-engine
 ```
 
-### 2. Start the Application (First Time)
+### 2. Start the App and Load Data in the Container
 ```bash
-docker-compose up --build
+docker compose up --build
+```
+
+This will run the following sequence inside the `rag-app` container:
+1. download the raw ArXiv metadata file from the configured `ARXIV_RAW_URL`,
+2. sample the first 10k qualifying records to `data/arxiv-dataset.json`,
+3. ingest the sampled records into the `arxiv_abstracts` Qdrant collection,
+4. start FastAPI and Streamlit.
+
+The data is persisted in the volume `qdrant_data:/qdrant/storage` so Qdrant keeps the collection between restarts.
+
+If the `arxiv_abstracts` collection already exists, ingestion is skipped and the app starts directly.
+
+### 3. Monitor Startup Progress
+```bash
+docker compose logs -f rag-app
 ```
 
 ⏱️ **Note:** First build will automatically:
-- Download and install all Python dependencies
-- Pre-download the embedding model (`BAAI/bge-large-en-v1.5`)
+- Download and install all Python dependencies for the app
+- Pre-download the embedding model (`BAAI/bge-small-en-v1.5`)
 - Pull and load the LLM model (`phi3:3.8b-mini-128k-instruct-q4_0`)
-- Set up Qdrant vector database
-- This may take 10-15 minutes(or less/more) depending on your internet connection
+- Start Qdrant and Ollama services
+- This may take 10-15 minutes (depending on your internet connection)
 
 ### 3. Monitor Startup Progress
 You'll see logs indicating the startup process:
@@ -96,7 +113,7 @@ rag-app  | INFO:     Started server process [7]
 rag-app  | INFO:     Waiting for application startup.
 rag-app  | INFO:app:Starting up application...
 rag-app  | INFO:app:Loading embedding model...
-rag-app  | INFO:sentence_transformers.SentenceTransformer:Load pretrained SentenceTransformer: BAAI/bge-large-en-v1.5
+rag-app  | INFO:sentence_transformers.SentenceTransformer:Load pretrained SentenceTransformer: BAAI/bge-small-en-v1.5
 ollama   | time=2025-07-26T09:11:13.894Z level=INFO source=server.go:637 msg="llama runner started in 4.28 seconds"
 ollama   | [GIN] 2025/07/26 - 09:11:14 | 200 |  5.105294711s |             ::1 | POST     "/api/chat"
 ollama   | ✅ Model loaded into memory.
@@ -112,8 +129,10 @@ rag-app  | INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to qui
 
 ### 4. Subsequent Runs
 ```bash
-docker-compose up
+docker compose up
 ```
+
+With the Qdrant volume already containing the ingested dataset, the application starts directly and queries the existing data. The one-time ingest step will be skipped if `arxiv_abstracts` already exists.
 
 🚀 **That's it!** No configuration files needed - everything is automated!
 
@@ -165,7 +184,7 @@ Once running, access the application through:
 The application comes pre-configured with optimized models:
 
 - **LLM Model**: `phi3:3.8b-mini-128k-instruct-q4_0` (automatically downloaded)
-- **Embedding Model**: `BAAI/bge-large-en-v1.5` (pre-downloaded during build)
+- **Embedding Model**: `BAAI/bge-small-en-v1.5` (pre-downloaded during build)
 - **Vector Database**: Qdrant with persistent storage
 - **Chunk Settings**: Optimized for document processing
 
@@ -236,7 +255,7 @@ docker-compose restart
 
 ## 📊 What Happens During First Build
 1. **Python Dependencies**: Downloads from requirements.txt (~500MB)
-2. **Embedding Model**: Pre-downloads `BAAI/bge-large-en-v1.5` (~1.2GB)
+2. **Embedding Model**: Pre-downloads `BAAI/bge-small-en-v1.5` (~500MB)
 3. **LLM Model**: Pulls `phi3:3.8b-mini-128k-instruct-q4_0` (~2.2GB)
 4. **Model Warm-up**: Loads model into memory for faster responses
 

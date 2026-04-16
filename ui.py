@@ -1,10 +1,13 @@
+import html
+import os
 import streamlit as st
 import requests
 import uuid  # ✅ For unique uploader key
 import json
 import time
 
-API_URL = "http://localhost:8000"
+# FastAPI base URL (routes are /upload, /files, /query_stream, /delete_file — not under /query_stream)
+API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 st.set_page_config(page_title="📚 Advanced RAG Assistant", layout="wide")
 
@@ -25,6 +28,8 @@ if "streaming_answer" not in st.session_state:
     st.session_state.streaming_answer = ""
 if "stream_complete" not in st.session_state:
     st.session_state.stream_complete = False
+if "final_sources" not in st.session_state:
+    st.session_state.final_sources = []
 
 st.title("📚 Your AI File Assistant : Upload, Ask, Learn")
 st.write(
@@ -97,7 +102,10 @@ if file_list:
         disabled=select_files_box_disabled or st.session_state.is_processing
     )
 else:
-    st.warning("No files uploaded yet.")
+    st.info(
+        "No PDFs uploaded yet. You can still ask questions: the app will search the **arXiv abstracts** "
+        "index in Qdrant. Upload PDFs below if you want to search your own documents instead."
+    )
     selected_files = []
 
 # === Ask a question ===
@@ -105,8 +113,8 @@ st.header("3️⃣ Ask a question")
 st.markdown(
     """
     <div style="background-color: #E3F2FD; padding: 15px; border-radius: 8px; border-left: 4px solid #2196F3; margin: 10px 0;">
-        ⚠️ <strong>Note:</strong> Please ask meaningful questions related to the uploaded file(s).<br><br>
-        ❌ Avoid random messages like <code>hello</code>, <code>how are you</code>, or generic questions — the assistant may not work correctly.<br><br>
+        ⚠️ <strong>Note:</strong> Ask questions that match your selected scope: <strong>uploaded PDFs</strong> (if any are selected) or the <strong>arXiv abstract</strong> index when no PDF is selected.<br><br>
+        ❌ Avoid empty chit-chat — the model only sees retrieved passages as context.<br><br>
     </div>
     """, 
     unsafe_allow_html=True
@@ -122,14 +130,12 @@ get_answer = st.button(
 if get_answer:
     if not question or not question.strip():
         st.error("❌ Please enter a question before clicking 'Get Answer'.")
-    # Validation: Check if no files are selected
-    elif not selected_files:
-        st.error("❌ Please select at least one PDF file to search before asking a question.")
     # All validations passed - proceed with the query
     else:
         # Clear previous answer when starting new query
         st.session_state.streaming_answer = ""
         st.session_state.final_answer = ""
+        st.session_state.final_sources = []
         st.session_state.is_processing = True
         st.session_state.pending_question = question
         st.session_state.pending_files = selected_files
@@ -144,18 +150,23 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
     answer_placeholder = st.empty()
     
     if st.session_state.is_processing and not st.session_state.stream_complete:
-        # Currently streaming
+        # Currently streaming (slow stages: embed → Qdrant → Ollama; first LLM token on CPU is often 15s–2min)
         payload = {
             "question": st.session_state.pending_question,
             "filenames": st.session_state.pending_files
         }
+        status_hint = st.empty()
         try:
-            with st.spinner("🔄 Generating answer..."):
+            with st.spinner(
+                "🔄 Embedding query → searching vectors → calling Ollama … "
+                "(first answer tokens are often slow on CPU; this is normal.)"
+            ):
                 with requests.post(
                     f"{API_URL}/query_stream",
                     json=payload,
                     stream=True,
-                    headers={'Accept': 'text/plain'}
+                    headers={'Accept': 'text/plain'},
+                    timeout=600,
                 ) as response:
                     if response.status_code == 200:
                         for line in response.iter_lines(chunk_size=1, decode_unicode=True):
@@ -163,16 +174,25 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
                                 try:
                                     data = json.loads(line[6:])  # Remove "data: " prefix
                                     if "chunk" in data:
+                                        status_hint.empty()
                                         st.session_state.streaming_answer += data["chunk"]
                                         answer_placeholder.markdown(st.session_state.streaming_answer)
                                         time.sleep(0.01)  # Small delay for better visual effect
                                     elif "done" in data and data["done"]:
                                         # Save final answer and reset processing state
                                         st.session_state.final_answer = st.session_state.streaming_answer
+                                        if "sources" in data:
+                                            st.session_state.final_sources = data["sources"]
                                         st.session_state.stream_complete = True
                                         st.session_state.is_processing = False
                                         st.rerun()  # Rerun to update UI
                                         break
+                                    elif "sources" in data:
+                                        st.session_state.final_sources = data["sources"]
+                                        status_hint.info(
+                                            "📎 **Context retrieved.** Waiting for the model to emit the first "
+                                            "tokens — on a CPU-bound Ollama setup this can take **well over a minute**."
+                                        )
                                     elif "error" in data:
                                         st.session_state.final_answer = data["error"]
                                         st.session_state.stream_complete = True
@@ -200,6 +220,28 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
                 answer_placeholder.error(st.session_state.final_answer)
             else:
                 answer_placeholder.markdown(st.session_state.final_answer)
+                sources = st.session_state.get("final_sources", [])
+                if sources:
+                    st.markdown("### Sources")
+                    for i, s in enumerate(sources):
+                        title = s.get("title", "Untitled")
+                        url = (s.get("url") or "").strip()
+                        passage = (s.get("passage") or "").strip()
+                        idx = i + 1
+                        if url:
+                            safe_href = html.escape(url, quote=True)
+                            safe_title = html.escape(title)
+                            st.markdown(
+                                f'<p>[{idx}] <a href="{safe_href}" target="_blank" rel="noopener noreferrer">{safe_title}</a></p>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(f"**[{idx}]** {html.escape(title)}")
+                            st.caption("No web URL for this hit (e.g. local PDF chunk or missing link in the index).")
+                        if passage:
+                            excerpt = passage if len(passage) <= 1200 else passage[:1200] + "…"
+                            with st.expander(f"Excerpt for [{idx}]"):
+                                st.text(excerpt)
 
 
 

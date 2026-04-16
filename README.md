@@ -278,19 +278,3 @@ Thanks to the amazing open-source projects that make this possible:
 - [FastAPI](https://fastapi.tiangolo.com/) - Modern web framework
 - [Streamlit](https://streamlit.io/) - App framework
 
----
-
-## 📞 Support
-
-- 💡 **Feature Requests**: [Start a discussion](https://github.com/noorjotk/local-rag-engine/discussions)
-- 📧 **Contact**: [kaurnoorjot11@gmail.com]
-
----
-
-<div align="center">
-
-**🧠 Built with ❤️ by [Noorjot Kaur](https://github.com/noorjotk)**
-
-*If this project helped you, please consider giving it a ⭐!*
-
-</div>

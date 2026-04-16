@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gzip
+import glob
 import json
 import os
 import uuid
@@ -11,9 +12,11 @@ from sentence_transformers import SentenceTransformer
 
 
 COLLECTION_NAME = "arxiv_abstracts"
-EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_LIMIT = 10_000
 DEFAULT_BATCH_SIZE = 128
+DEFAULT_SAMPLE_PATH = os.getenv("ARXIV_DATASET_PATH", "data/arxiv-dataset.json")
+DEFAULT_RAW_DIR = os.getenv("ARXIV_RAW_DIR", "data/arxiv_raw")
 
 
 def parse_args():
@@ -37,6 +40,11 @@ def parse_args():
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help="Embedding and upsert batch size.",
+    )
+    parser.add_argument(
+        "--raw-dir",
+        default=os.getenv("ARXIV_RAW_DIR", DEFAULT_RAW_DIR),
+        help="Path to the raw dataset directory (parquet/json/csv files).",
     )
     return parser.parse_args()
 
@@ -101,6 +109,14 @@ def iter_csv_records(path):
         yield from reader
 
 
+def iter_parquet_records(path):
+    import pandas as pd
+
+    df = pd.read_parquet(path)
+    for _, row in df.iterrows():
+        yield row.to_dict()
+
+
 def iter_dataset_records(path):
     lowered = path.lower()
     if lowered.endswith((".csv", ".csv.gz")):
@@ -109,14 +125,44 @@ def iter_dataset_records(path):
     if lowered.endswith((".json", ".jsonl", ".json.gz", ".jsonl.gz")):
         yield from iter_json_records(path)
         return
+    if lowered.endswith(".parquet"):
+        yield from iter_parquet_records(path)
+        return
     raise ValueError(
-        "Unsupported dataset format. Use .json, .jsonl, .csv, or gzip-compressed variants."
+        "Unsupported dataset format. Use .json, .jsonl, .csv, .parquet, or gzip-compressed variants."
     )
+
+
+def iter_directory_records(directory):
+    supported = [".parquet", ".json", ".jsonl", ".json.gz", ".jsonl.gz", ".csv", ".csv.gz"]
+    for file_path in glob.glob(os.path.join(directory, "**", "*"), recursive=True):
+        if os.path.isdir(file_path):
+            continue
+        lowered = file_path.lower()
+        if any(lowered.endswith(ext) for ext in supported):
+            yield from iter_dataset_records(file_path)
+
+
+def is_data_dir_populated(directory):
+    if not os.path.isdir(directory):
+        return False
+    supported = [".parquet", ".json", ".jsonl", ".json.gz", ".jsonl.gz", ".csv", ".csv.gz"]
+    for file_path in glob.glob(os.path.join(directory, "**", "*"), recursive=True):
+        if os.path.isdir(file_path):
+            continue
+        if any(file_path.lower().endswith(ext) for ext in supported):
+            return True
+    return False
 
 
 def load_documents(path, limit):
     documents = []
-    for raw_record in iter_dataset_records(path):
+    if os.path.isdir(path):
+        record_iter = iter_directory_records(path)
+    else:
+        record_iter = iter_dataset_records(path)
+
+    for raw_record in record_iter:
         record = normalize_record(raw_record)
         if record is None:
             continue
@@ -145,23 +191,30 @@ def reset_collection(client, vector_size):
 def main():
     args = parse_args()
     dataset_path = args.dataset
+    raw_dir = args.raw_dir
 
     qdrant_host = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
     client = QdrantClient(host=qdrant_host, port=qdrant_port)
 
     if collection_exists(client, COLLECTION_NAME):
-        print(f"Collection '{COLLECTION_NAME}' already exists, skipping ingest.")
-        return
+        print(f"Collection '{COLLECTION_NAME}' already exists, deleting it before ingest.")
+        client.delete_collection(collection_name=COLLECTION_NAME)
 
-    if not dataset_path:
+    if dataset_path and os.path.exists(dataset_path):
+        source_path = dataset_path
+        print(f"📄 Using sample dataset file: {source_path}")
+    elif is_data_dir_populated(raw_dir):
+        source_path = raw_dir
+        print(f"📁 Using raw dataset directory: {source_path}")
+    else:
         raise SystemExit(
-            "Dataset path is required. Pass it as an argument or set ARXIV_DATASET_PATH."
+            f"Dataset not found: {dataset_path}. "
+            f"No supported files found in raw dir: {raw_dir}. "
+            "Run download_data.py first or provide a dataset path."
         )
-    if not os.path.exists(dataset_path):
-        raise SystemExit(f"Dataset not found: {dataset_path}")
 
-    documents = load_documents(dataset_path, args.limit)
+    documents = load_documents(source_path, args.limit)
     if not documents:
         raise SystemExit("No valid records found in dataset.")
 

@@ -1,129 +1,118 @@
 import json
 import os
 import sys
-import requests
+import glob
 
 from huggingface_hub import snapshot_download
 
-DEFAULT_RAW_URL = os.getenv("ARXIV_RAW_URL", "")
-DEFAULT_RAW_PATH = os.getenv("ARXIV_RAW_PATH", "data/arxiv-metadata-oai-snapshot.json")
+
 DEFAULT_SAMPLE_PATH = os.getenv("ARXIV_SAMPLE_PATH", "data/arxiv-dataset.json")
 DEFAULT_SAMPLE_SIZE = int(os.getenv("ARXIV_SAMPLE_SIZE", "10000"))
-DEFAULT_SNAPSHOT_REPO = os.getenv("ARXIV_HF_REPO", "Just-Curieous/arxiv-cs-paper-metadata-embedding")
+DEFAULT_SNAPSHOT_REPO = os.getenv(
+    "ARXIV_HF_REPO",
+    "permutans/arxiv-papers-by-subject"
+)
+DEFAULT_RAW_DIR = os.getenv("ARXIV_RAW_DIR", "data/arxiv_raw")
 
 
-def download_file(url: str, output_path: str):
-    if not url:
-        raise ValueError(
-            "ARXIV_RAW_URL is not set. Set this environment variable to a raw ArXiv metadata URL."
-        )
-
-    if os.path.exists(output_path):
-        print(f"✅ Raw data already exists at {output_path}, skipping download.")
-        return
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    print(f"🔽 Downloading raw ArXiv metadata from {url}...")
-
-    with requests.get(url, stream=True, timeout=120) as response:
-        response.raise_for_status()
-        with open(output_path, "wb") as out_file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    out_file.write(chunk)
-
-    print(f"✅ Download complete: {output_path}")
-
-
-def download_snapshot(output_path: str):
-    output_dir = os.path.dirname(output_path) or "."
+# -----------------------------
+# Step 1: Download dataset (CS only)
+# -----------------------------
+def download_snapshot(output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
-    print(
-        f"🔽 Downloading Hugging Face snapshot repo {DEFAULT_SNAPSHOT_REPO} into {output_dir}..."
-    )
+
+    print(f"🔽 Downloading dataset: {DEFAULT_SNAPSHOT_REPO}")
+
     snapshot_download(
         repo_id=DEFAULT_SNAPSHOT_REPO,
         repo_type="dataset",
+        allow_patterns=[
+            "data/cs.AI/2025/*/train-00000*.parquet"
+        ],
         local_dir=output_dir,
+        token=False,
     )
 
-    if os.path.exists(output_path):
-        print(f"✅ Snapshot data already present at {output_path}.")
-        return
-
-    candidates = [
-        f for f in os.listdir(output_dir)
-        if f.endswith((".json", ".jsonl", ".json.gz", ".jsonl.gz"))
-    ]
-    if not candidates:
-        raise FileNotFoundError(
-            f"No dataset file found in {output_dir} after snapshot_download."
-        )
-
-    first_file = os.path.join(output_dir, candidates[0])
-    if first_file != output_path:
-        os.replace(first_file, output_path)
-    print(f"✅ Snapshot data saved to {output_path}")
+    print(f"✅ Download complete: {output_dir}")
 
 
-def sample_arxiv_data(input_file, output_file, n=100):
-    """
-    Read the first N lines from the raw Arxiv dataset and save them.
-    """
+# -----------------------------
+# Step 2: Read parquet files
+# -----------------------------
+def iter_parquet_records(file_path):
+    import pandas as pd
+
+    df = pd.read_parquet(file_path)
+
+    for _, row in df.iterrows():
+        yield row.to_dict()
+
+
+# -----------------------------
+# Step 3: Sample data
+# -----------------------------
+def sample_arxiv_data(input_dir, output_file, n=10000):
     if os.path.exists(output_file):
-        print(f"✅ Sample file already exists at {output_file}, skipping sampling.")
+        print(f"✅ Sample file already exists at {output_file}, skipping.")
         return
 
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Raw file not found: {input_file}")
+    print(f"🔄 Sampling {n} records from parquet files...")
 
-    print(f"🔄 Extracting the first {n} records from {input_file}...")
+    parquet_files = glob.glob(f"{input_dir}/**/*.parquet", recursive=True)
+
+    if not parquet_files:
+        raise FileNotFoundError("No parquet files found. Did download fail?")
+
     sampled_data = []
 
-    with open(input_file, "r", encoding="utf-8") as f:
-        for line in f:
+    for file in parquet_files:
+        print(f"📄 Processing {file}")
+
+        for item in iter_parquet_records(file):
             if len(sampled_data) >= n:
                 break
-            line = line.strip()
-            if not line:
+
+            title = str(item.get("title", "")).strip()
+            abstract = str(item.get("abstract", "")).strip()
+
+            if not title or not abstract:
                 continue
 
-            item = json.loads(line)
-            categories = item.get("categories", "")
-            if not any(cat.startswith("cs.") for cat in categories.split()):
-                continue
+            paper_id = str(item.get("arxiv_id", "")).strip()
 
-            paper_id = item.get("id")
-            relevant_data = {
+            sampled_data.append({
                 "id": paper_id,
-                "title": item.get("title"),
-                "abstract": item.get("abstract"),
-                "link": f"https://arxiv.org/abs/{paper_id}" if paper_id else None,
-            }
-            sampled_data.append(relevant_data)
+                "title": title,
+                "abstract": abstract,
+                "link": f"https://arxiv.org/abs/{paper_id}"
+            })
+
+        if len(sampled_data) >= n:
+            break
+
+    if not sampled_data:
+        raise ValueError("No valid records found.")
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(sampled_data, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ Done! Sampled data saved to: {output_file}")
+    print(f"✅ Done! Saved {len(sampled_data)} records to {output_file}")
 
 
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
-    raw_path = DEFAULT_RAW_PATH
+    raw_dir = DEFAULT_RAW_DIR
     sample_path = DEFAULT_SAMPLE_PATH
     sample_size = DEFAULT_SAMPLE_SIZE
 
     try:
-        if DEFAULT_RAW_URL.strip():
-            print(f"🚀 Detected ARXIV_RAW_URL. Prioritizing direct download...")
-            download_file(DEFAULT_RAW_URL, raw_path)
-        else:
-            print(f"🚀 No direct URL provided. Using Hugging Face repo: {DEFAULT_SNAPSHOT_REPO}")
-            download_snapshot(raw_path)
-            
-        sample_arxiv_data(raw_path, sample_path, n=sample_size)
-        
+        download_snapshot(raw_dir)
+        sample_arxiv_data(raw_dir, sample_path, n=sample_size)
+
     except Exception as exc:
         print(f"❌ Failed: {exc}")
         sys.exit(1)

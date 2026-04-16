@@ -4,28 +4,20 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy requirements first for better Docker caching
 COPY requirements.txt .
 
-# Install dependencies
+# Install CPU-only PyTorch first so sentence-transformers can import it reliably
+RUN pip install --no-cache-dir -f https://download.pytorch.org/whl/cpu torch==2.4.0
 RUN pip install --no-cache-dir -r requirements.txt
-
-# PRE-DOWNLOAD THE EMBEDDING MODEL (This fixes the 3-4 minute delay!)
-RUN python -c "from sentence_transformers import SentenceTransformer; print('🔄 Downloading BAAI/bge-large-en-v1.5...'); model = SentenceTransformer('BAAI/bge-large-en-v1.5'); print('✅ Model downloaded successfully')"
-
 
 # Copy all code
 COPY . .
 
-# Set environment variables for better performance
+# Set environment variables for better performance and cache persistence
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/app/.cache/huggingface
-
+ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
 
 # Expose ports for FastAPI (8000) and Streamlit (8501)
 EXPOSE 8000

@@ -1,9 +1,12 @@
 import argparse
+from collections import OrderedDict
 import csv
 import gzip
 import glob
+import hashlib
 import json
 import os
+import re
 import uuid
 
 from qdrant_client import QdrantClient
@@ -13,6 +16,8 @@ from sentence_transformers import SentenceTransformer
 
 COLLECTION_NAME = "arxiv_abstracts"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+# Deterministic UUID namespace for Qdrant point ids (same arXiv paper → same id → upsert overwrites)
+ARXIV_QDRANT_POINT_NS = uuid.UUID("a3e84c61-4f2b-4c6e-8b1d-0f2a7e9c4d11")
 DEFAULT_LIMIT = 10_000
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_SAMPLE_PATH = os.getenv("ARXIV_DATASET_PATH", "data/arxiv-dataset.json")
@@ -70,6 +75,48 @@ def _scalar_str(value):
     return s
 
 
+def _strip_arxiv_version(arxiv_id: str) -> str:
+    """Normalize 2503.01086v2 → 2503.01086 for stable keys."""
+    s = arxiv_id.strip()
+    m = re.match(r"^(.+?)v(\d+)$", s, re.I)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def _stable_point_key(record, title: str, abstract: str, source_url: str) -> str:
+    """
+    One stable string per logical paper. Used for UUIDv5 and deduplication.
+    Prefix disambiguates id namespaces (arxiv vs doi vs content hash).
+    """
+    pid = _scalar_str(
+        record.get("arxiv_id")
+        or record.get("id")
+        or record.get("paper_id")
+    )
+    if pid:
+        pid = _strip_arxiv_version(pid).lower()
+        return f"arxiv:{pid}"
+
+    doi = _scalar_str(record.get("doi"))
+    if doi:
+        return f"doi:{doi.lower()}"
+
+    u = (source_url or "").strip()
+    if "arxiv.org/abs/" in u:
+        tail = u.split("arxiv.org/abs/", 1)[1].split("?")[0].strip("/")
+        tail = _strip_arxiv_version(tail).lower()
+        return f"arxiv:{tail}"
+
+    h = hashlib.sha256(f"{title}\n{abstract}".encode("utf-8")).hexdigest()
+    return f"hash:{h}"
+
+
+def point_id_from_key(point_key: str) -> str:
+    """Qdrant accepts UUID strings; UUIDv5 is deterministic from arXiv id."""
+    return str(uuid.uuid5(ARXIV_QDRANT_POINT_NS, point_key))
+
+
 def normalize_record(record):
     abstract = (
         record.get("abstract")
@@ -104,11 +151,20 @@ def normalize_record(record):
     if not abstract or not title:
         return None
 
+    point_key = _stable_point_key(record, title, abstract, source_url)
+    display_arxiv = _strip_arxiv_version(
+        _scalar_str(record.get("arxiv_id") or record.get("id") or record.get("paper_id"))
+    )
+    if not display_arxiv and "arxiv:" in point_key:
+        display_arxiv = point_key.split("arxiv:", 1)[1]
+
     return {
         "text": abstract,
         "title": title,
         "source_url": source_url,
         "link": source_url,
+        "arxiv_id": display_arxiv,
+        "_point_key": point_key,
     }
 
 
@@ -184,20 +240,24 @@ def is_data_dir_populated(directory):
 
 
 def load_documents(path, limit):
-    documents = []
+    """Deduplicate by _point_key so the same paper is not embedded twice (e.g. overlapping files)."""
     if os.path.isdir(path):
         record_iter = iter_directory_records(path)
     else:
         record_iter = iter_dataset_records(path)
 
+    by_key = OrderedDict()
     for raw_record in record_iter:
         record = normalize_record(raw_record)
         if record is None:
             continue
-        documents.append(record)
-        if len(documents) >= limit:
+        key = record["_point_key"]
+        if key in by_key:
+            continue
+        by_key[key] = record
+        if len(by_key) >= limit:
             break
-    return documents
+    return list(by_key.values())
 
 
 def collection_exists(client, collection_name: str) -> bool:
@@ -265,28 +325,24 @@ def main():
     qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
     client = QdrantClient(host=qdrant_host, port=qdrant_port)
 
-    first_vector = model.encode(documents[0]["text"]).tolist()
+    dim = len(model.encode(documents[0]["text"]).tolist())
     if not collection_exists_flag:
-        reset_collection(client, len(first_vector))
+        reset_collection(client, dim)
     else:
         print(f"Appending documents to existing collection '{COLLECTION_NAME}'.")
 
-    first_point = PointStruct(
-        id=str(uuid.uuid4()),
-        vector=first_vector,
-        payload=documents[0],
-    )
-    client.upsert(collection_name=COLLECTION_NAME, points=[first_point])
+    def payload_only(doc: dict) -> dict:
+        return {k: v for k, v in doc.items() if k != "_point_key"}
 
-    for start in range(1, len(documents), args.batch_size):
+    for start in range(0, len(documents), args.batch_size):
         batch = documents[start:start + args.batch_size]
         texts = [doc["text"] for doc in batch]
         vectors = model.encode(texts, batch_size=args.batch_size)
         points = [
             PointStruct(
-                id=str(uuid.uuid4()),
+                id=point_id_from_key(doc["_point_key"]),
                 vector=vector.tolist(),
-                payload=doc,
+                payload=payload_only(doc),
             )
             for doc, vector in zip(batch, vectors)
         ]

@@ -3,10 +3,13 @@ import os
 import sys
 import requests
 
+from huggingface_hub import snapshot_download
+
 DEFAULT_RAW_URL = os.getenv("ARXIV_RAW_URL", "")
 DEFAULT_RAW_PATH = os.getenv("ARXIV_RAW_PATH", "data/arxiv-metadata-oai-snapshot.json")
 DEFAULT_SAMPLE_PATH = os.getenv("ARXIV_SAMPLE_PATH", "data/arxiv-dataset.json")
 DEFAULT_SAMPLE_SIZE = int(os.getenv("ARXIV_SAMPLE_SIZE", "10000"))
+DEFAULT_SNAPSHOT_REPO = os.getenv("ARXIV_HF_REPO", "Just-Curieous/arxiv-cs-paper-metadata-embedding")
 
 
 def download_file(url: str, output_path: str):
@@ -30,6 +33,37 @@ def download_file(url: str, output_path: str):
                     out_file.write(chunk)
 
     print(f"✅ Download complete: {output_path}")
+
+
+def download_snapshot(output_path: str):
+    output_dir = os.path.dirname(output_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    print(
+        f"🔽 Downloading Hugging Face snapshot repo {DEFAULT_SNAPSHOT_REPO} into {output_dir}..."
+    )
+    snapshot_download(
+        repo_id=DEFAULT_SNAPSHOT_REPO,
+        repo_type="dataset",
+        local_dir=output_dir,
+    )
+
+    if os.path.exists(output_path):
+        print(f"✅ Snapshot data already present at {output_path}.")
+        return
+
+    candidates = [
+        f for f in os.listdir(output_dir)
+        if f.endswith((".json", ".jsonl", ".json.gz", ".jsonl.gz"))
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No dataset file found in {output_dir} after snapshot_download."
+        )
+
+    first_file = os.path.join(output_dir, candidates[0])
+    if first_file != output_path:
+        os.replace(first_file, output_path)
+    print(f"✅ Snapshot data saved to {output_path}")
 
 
 def sample_arxiv_data(input_file, output_file, n=100):
@@ -81,8 +115,15 @@ if __name__ == "__main__":
     sample_size = DEFAULT_SAMPLE_SIZE
 
     try:
-        download_file(DEFAULT_RAW_URL, raw_path)
+        if DEFAULT_RAW_URL.strip():
+            print(f"🚀 Detected ARXIV_RAW_URL. Prioritizing direct download...")
+            download_file(DEFAULT_RAW_URL, raw_path)
+        else:
+            print(f"🚀 No direct URL provided. Using Hugging Face repo: {DEFAULT_SNAPSHOT_REPO}")
+            download_snapshot(raw_path)
+            
         sample_arxiv_data(raw_path, sample_path, n=sample_size)
+        
     except Exception as exc:
         print(f"❌ Failed: {exc}")
         sys.exit(1)

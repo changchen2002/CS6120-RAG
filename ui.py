@@ -9,6 +9,19 @@ import time
 # FastAPI base URL (routes are /upload, /files, /query_stream, /delete_file — not under /query_stream)
 API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
+# Retrieved passage preview length in Sources expander (do not print full text on the main page)
+_SOURCES_PREVIEW_MAX_WORDS = 300
+
+
+def _preview_passage_words(text: str, max_words: int = _SOURCES_PREVIEW_MAX_WORDS) -> str:
+    if not text or not str(text).strip():
+        return ""
+    words = str(text).split()
+    if len(words) <= max_words:
+        return str(text).strip()
+    return " ".join(words[:max_words]) + " …"
+
+
 st.set_page_config(page_title="📚 Advanced RAG Assistant", layout="wide")
 
 #initializing session state keys
@@ -239,10 +252,9 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
                             st.markdown(f"**[{idx}]** {html.escape(title)}")
                             st.caption("No web URL for this hit (e.g. local PDF chunk or missing link in the index).")
                         if passage:
-                            excerpt = passage if len(passage) <= 1200 else passage[:1200] + "…"
-                            with st.expander(f"Excerpt for [{idx}]"):
-                                st.text(excerpt)
-
+                            preview = _preview_passage_words(passage)
+                            with st.expander(f"Passage preview for [{idx}] (max ~{_SOURCES_PREVIEW_MAX_WORDS} words)"):
+                                st.text(preview)
 
 
 # === Delete selected file embeddings from vector db ===
@@ -272,3 +284,4 @@ if selected_files:
                     st.session_state.show_confirm = False    
             except Exception as e:
                 st.error(f"API request failed: {e}")
+

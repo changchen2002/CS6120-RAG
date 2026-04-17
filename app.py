@@ -68,6 +68,8 @@ OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
 PDF_COLLECTION_NAME = "RAG-3.0"
 ARXIV_COLLECTION_NAME = "arxiv_abstracts"
 UPLOADED_FILES_COLLECTION_NAME = "uploaded_files"
+# Top-k retrieved passages for the LLM (arxiv: 2 abstracts; PDF mode uses same cap)
+RETRIEVAL_TOP_K = 2
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 class QueryRequest(BaseModel):
@@ -92,14 +94,23 @@ def ensure_collection(collection_name: str, vector_size: int) -> None:
 
 
 def build_sources(hits):
-    return [
-        {
-            "title": hit.payload.get("title") or hit.payload.get("filename", "Untitled"),
-            "url": hit.payload.get("link") or hit.payload.get("source_url", ""),
-            "passage": hit.payload.get("text", "")
-        }
-        for hit in hits
-    ]
+    """De-duplicate sources if the index still contains identical papers (legacy duplicates)."""
+    rows = []
+    seen = set()
+    for hit in hits:
+        payload = hit.payload or {}
+        title = payload.get("title") or payload.get("filename", "Untitled")
+        url = (payload.get("link") or payload.get("source_url") or "").strip()
+        passage = payload.get("text", "") or ""
+        if url:
+            key = ("url", url, title.strip())
+        else:
+            key = ("txt", title.strip(), passage[:400])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"title": title, "url": url, "passage": passage})
+    return rows
 
 
 def collection_exists(collection_name: str) -> bool:
@@ -267,7 +278,7 @@ async def query_rag_stream(req: QueryRequest):
             hits = qdrant.search(
                 collection_name=collection_name,
                 query_vector=query_vector,
-                limit=3,
+                limit=RETRIEVAL_TOP_K,
                 query_filter=filters
             )
             logger.info(f"Qdrant search completed, found {len(hits)} hits")
@@ -284,7 +295,11 @@ async def query_rag_stream(req: QueryRequest):
         yield "data: " + json.dumps({"sources": sources}) + "\n\n"
 
         context = "\n\n".join([hit.payload["text"] for hit in hits])
-        prompt = f"Answer the question using only the context.\n\nContext:\n{context}\n\nQuestion:\n{question}\nAnswer:"
+        prompt = (
+            "Answer using only the context below. "
+            "Respond in exactly 2 or 3 complete sentences. Do not use bullet points or headings.\n\n"
+            f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer (2-3 sentences):"
+        )
         
         # Ollama streaming request
         logger.info("Starting Ollama streaming request...")
@@ -297,7 +312,11 @@ async def query_rag_stream(req: QueryRequest):
                     json={
                         "model": "phi3:3.8b-mini-128k-instruct-q4_0",
                         "prompt": prompt,
-                        "stream": True
+                        "stream": True,
+                        "options": {
+                            # Soft cap to discourage long answers (2–3 sentences ≪ this in practice)
+                            "num_predict": 220,
+                        },
                     }
                 ) as response:
                     ollama_time = time.time() - ollama_start
@@ -352,7 +371,6 @@ def list_files():
     except Exception as e:
         logger.error(f"List files error: {e}")
         return {"error": f"Qdrant scroll failed: {str(e)}"}
-
 @app.post("/delete_file")
 def delete_file(req: DeleteRequest):
     try:
@@ -386,3 +404,4 @@ def delete_file(req: DeleteRequest):
     except Exception as e:
         logger.error(f"Delete error: {e}")
         return {"error": f"Delete failed: {str(e)}"} 
+

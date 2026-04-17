@@ -1,0 +1,19 @@
+# Hugging Face cache — mounted at runtime via docker-compose; must not be in the image
+hf_cache/
+# Large / local data
+data/arxiv_raw/
+data/arxiv-dataset.json
+# Git and Python noise
+.git/
+.gitignore
+**/__pycache__/
+**/*.pyc
+.venv/
+venv/
+*.egg-info/
+.env
+.env.*
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

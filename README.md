@@ -22,7 +22,7 @@ A fully local, end-to-end Retrieval-Augmented Generation (RAG) system built with
 - 🎨 **Streamlit** – simple and interactive frontend UI
 - 🔍 **Qdrant** – high-performance vector database
 - 🤖 **Ollama** – run LLMs like Phi3/Mistral etc locally
-- 📄 **PDF Support** – upload documents and ask questions
+- 💬 **Chat UI** – Streamlit chat interface over the arXiv index
 
 This project is configured so that the `rag-app` service will run `python scripts/download_data.py` and then `python scripts/ingest_arxiv.py` before starting FastAPI and Streamlit.
 If the `arxiv_abstracts` collection already exists, ingestion is skipped automatically.
@@ -32,14 +32,12 @@ The Qdrant volume `qdrant_data:/qdrant/storage` persists the ingested data, so s
 
 ## 🚀 Features
 
-- 📁 Upload **PDFs** and extract content
-- 🧠 Embed content using `sentence-transformers`
-- 🔍 Store and search with **Qdrant** vector database
-- 🤖 Query documents using **local LLMs via Ollama**
-- 🧩 Smart chunking and **clustering** support via `LangChain` & `scikit-learn`
-- 🛡️ 100% **offline** — your data never leaves your machine
-- ⚡ Fast retrieval and response generation
-- 🎯 Semantic search with relevance scoring
+- 🧠 Query embeddings via `sentence-transformers`
+- 🔍 **Qdrant** vector search over ingested arXiv abstracts
+- 🤖 **Ollama** local LLM generation with streaming
+- 💬 **Conversational** Streamlit UI with citations and retrieval confidence
+- 🛡️ 100% **offline** — index and models stay on your machine
+- 🎯 Semantic search with similarity scores for instructor review
 
 ### 🔥 What Makes This Different
 
@@ -166,19 +164,16 @@ Once running, access the application through:
 ### Code and data provenance
 - **Reproducible & containerized**: `Dockerfile` + `docker-compose.yml`, pinned **`requirements.txt`**, fixed embedding model id, and scripts under `scripts/` for download + ingest. Rebuild images for a clean environment.
 - **Modeling methodology (RAG vs. supervised classification)**: This app is **retrieval + generation**, not a classifier trained on labeled classes—so “class imbalance” in the arXiv corpus mainly means **topic frequency skew** in the index. Mitigations already in use: **top‑k cap**, **score-based confidence**, **deterministic dedupe** in `ingest_arxiv.py`, and **citation-first** answers.
-- **PDF path**: Chunks are grouped with **KMeans** for metadata; that is a **heuristic**, not a trained classifier—avoid over-interpreting cluster ids. Mitigation: fixed `random_state`, bounded `k`, and chunking via LangChain splitters to limit overfitting to any single chunk.
 
 ---
 
 ## 📖 Usage Guide
 
 ### Basic Workflow
-1. **Start the application** using Docker Compose
-2. **Open Streamlit UI** at http://localhost:8501
-3. **Upload PDF documents** through the file uploader
-4. **Wait for processing**
-5. **Ask questions** about your documents
-6. **Get AI-powered answers**
+1. **Start the application** with Docker Compose (ingest runs on first start if needed).
+2. **Open the chat UI** at http://localhost:8501.
+3. **Ask questions** in the chat; answers use retrieved arXiv passages plus the local LLM.
+4. **Review sources** and similarity scores under each reply (useful for grading / hallucination checks).
 
 ---
 
@@ -191,8 +186,7 @@ Once running, access the application through:
 | **Vector DB** | Qdrant | Similarity search & storage |
 | **LLM Runtime** | Ollama | Local language model inference |
 | **Embeddings** | sentence-transformers | Text vectorization |
-| **Document Processing** | LangChain | Text chunking & QA chains |
-| **Clustering** | scikit-learn | Document similarity grouping |
+| **Ingest** | `scripts/ingest_arxiv.py` | Build Qdrant from sampled arXiv data |
 | **Containerization** | Docker + Compose | Deployment & orchestration |
 
 ---
@@ -266,7 +260,7 @@ docker-compose restart
 
 ✅ **No OpenAI API key required**  
 ✅ **No remote API calls**  
-✅ **Your files stay on your machine**  
+✅ **Your index and models stay on your machine**  
 ✅ **Ideal for privacy-conscious use cases**  
 ✅ **Perfect for secure environments**  
 
@@ -293,7 +287,6 @@ Thanks to the amazing open-source projects that make this possible:
 - [Qdrant](https://qdrant.tech/) - Vector database
 - [Ollama](https://ollama.ai/) - Local LLM runtime
 - [Sentence Transformers](https://www.sbert.net/) - Embedding models
-- [LangChain](https://langchain.com/) - LLM application framework
 - [FastAPI](https://fastapi.tiangolo.com/) - Modern web framework
 - [Streamlit](https://streamlit.io/) - App framework
 

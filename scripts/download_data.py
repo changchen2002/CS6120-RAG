@@ -27,6 +27,7 @@ def download_snapshot(output_dir: str):
         repo_id=DEFAULT_SNAPSHOT_REPO,
         repo_type="dataset",
         allow_patterns=[
+            "data/cs.AI/2024/*/train-00000*.parquet",
             "data/cs.AI/2025/*/train-00000*.parquet"
         ],
         local_dir=output_dir,

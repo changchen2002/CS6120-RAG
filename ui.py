@@ -66,12 +66,12 @@ def _render_assistant_extras(retrieval_info, sources):
                     st.text(preview)
 
 
-st.set_page_config(page_title="arXiv RAG Chat", layout="wide")
+st.set_page_config(page_title="Citation RAG", layout="wide")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-st.title("arXiv RAG Chat")
+st.title("Citation RAG")
 st.caption("Answers use retrieved arXiv abstracts from your local Qdrant index. All processing stays on your machine.")
 
 with st.sidebar:

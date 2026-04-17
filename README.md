@@ -1,4 +1,4 @@
-# 🧠 Local RAG App with Qdrant + Ollama
+# 🧠 Citation RAG
 <div align="center">
 
 ![Ollama](https://img.shields.io/badge/Ollama-000000?style=for-the-badge&logo=ollama&logoColor=white)
@@ -41,7 +41,7 @@ The Qdrant volume `qdrant_data:/qdrant/storage` persists the ingested data, so s
 
 ### 🔥 What Makes This Different
 
-|❌ **Traditional RAG Setup** |✅ **This Project** |
+|❌ **Traditional RAG Setup** |✅ **Citation RAG** |
 |---|---|
 | Install Python manually | ✅ Containerized |
 | Download Ollama separately | ✅ Auto-installed |
@@ -204,7 +204,7 @@ The application comes pre-configured with optimized models:
 ### Architecture Overview
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   RAG App       │    │     Ollama      │    │     Qdrant      │
+│  Citation RAG   │    │     Ollama      │    │     Qdrant      │
 │ FastAPI+Streamlit│◄──►│   (Phi-3 Model) │    │ (Vector Store)  │
 │  Port: 8000/8501│    │  Port: 11434    │    │  Port: 6333     │
 └─────────────────┘    └─────────────────┘    └─────────────────┘

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-app = FastAPI()
+app = FastAPI(title="Citation RAG")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -145,7 +145,7 @@ async def startup_event():
 def health():
     return {
         "status": "ok",
-        "service": "local-rag-engine",
+        "service": "Citation RAG",
         "api_key_required": bool(RAG_API_KEY),
         "qdrant": f"{QDRANT_HOST}:{QDRANT_PORT}",
         "ollama": f"{OLLAMA_HOST}:{OLLAMA_PORT}",

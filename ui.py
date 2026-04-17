@@ -257,6 +257,7 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
                                 st.text(preview)
 
 
+
 # === Delete selected file embeddings from vector db ===
 st.header("4️⃣ Remove selected files from AI memory")
 
@@ -284,4 +285,3 @@ if selected_files:
                     st.session_state.show_confirm = False    
             except Exception as e:
                 st.error(f"API request failed: {e}")
-

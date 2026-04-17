@@ -371,6 +371,7 @@ def list_files():
     except Exception as e:
         logger.error(f"List files error: {e}")
         return {"error": f"Qdrant scroll failed: {str(e)}"}
+
 @app.post("/delete_file")
 def delete_file(req: DeleteRequest):
     try:
@@ -404,4 +405,3 @@ def delete_file(req: DeleteRequest):
     except Exception as e:
         logger.error(f"Delete error: {e}")
         return {"error": f"Delete failed: {str(e)}"} 
-

@@ -54,6 +54,10 @@ services:
       - QDRANT_PORT=6333
       - OLLAMA_HOST=ollama
       - OLLAMA_PORT=11434
+      # Optional: set the same secret for API + Streamlit when exposing ports publicly
+      # - RAG_API_KEY=change-me
+      # - RAG_SCORE_HIGH=0.48
+      # - RAG_SCORE_LOW=0.30
       - ARXIV_RAW_URL=
       - ARXIV_HF_REPO=permutans/arxiv-papers-by-subject
       - ARXIV_DATASET_PATH=data/arxiv-dataset.json

@@ -9,8 +9,9 @@ import threading
 import httpx
 import asyncio
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, Filter, FieldCondition, MatchValue
@@ -70,7 +71,22 @@ ARXIV_COLLECTION_NAME = "arxiv_abstracts"
 UPLOADED_FILES_COLLECTION_NAME = "uploaded_files"
 # Top-k retrieved passages for the LLM (arxiv: 2 abstracts; PDF mode uses same cap)
 RETRIEVAL_TOP_K = 2
+# Cosine similarity from Qdrant (higher = closer match). Tune for your embedding space.
+RAG_SCORE_HIGH = float(os.getenv("RAG_SCORE_HIGH", "0.48"))
+RAG_SCORE_LOW = float(os.getenv("RAG_SCORE_LOW", "0.30"))
+# Optional: set RAG_API_KEY in production so only clients with header X-API-Key can call protected routes.
+RAG_API_KEY = os.getenv("RAG_API_KEY", "").strip()
+
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(x_api_key: str | None = Depends(_api_key_header)) -> None:
+    if not RAG_API_KEY:
+        return
+    if not x_api_key or x_api_key != RAG_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
 
 class QueryRequest(BaseModel):
     question: str
@@ -94,9 +110,11 @@ def ensure_collection(collection_name: str, vector_size: int) -> None:
 
 
 def build_sources(hits):
-    """De-duplicate sources if the index still contains identical papers (legacy duplicates)."""
-    rows = []
-    seen = set()
+    """
+    De-duplicate sources; keep highest Qdrant similarity score per key.
+    Instructors/TAs can compare the answer to cited passages and similarity_score to spot unsupported claims.
+    """
+    best: dict = {}
     for hit in hits:
         payload = hit.payload or {}
         title = payload.get("title") or payload.get("filename", "Untitled")
@@ -106,11 +124,36 @@ def build_sources(hits):
             key = ("url", url, title.strip())
         else:
             key = ("txt", title.strip(), passage[:400])
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append({"title": title, "url": url, "passage": passage})
-    return rows
+        score = getattr(hit, "score", None)
+        try:
+            score_f = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score_f = None
+        row = {
+            "title": title,
+            "url": url,
+            "passage": passage,
+            "similarity_score": round(score_f, 4) if score_f is not None else None,
+        }
+        prev = best.get(key)
+        if prev is None or (score_f is not None and (prev[0] is None or score_f > prev[0])):
+            best[key] = (score_f, row)
+    return [v[1] for v in best.values()]
+
+
+def retrieval_confidence_from_scores(scores: List[float]) -> tuple:
+    """Return (label, max_score, mean_score) for transparency."""
+    if not scores:
+        return "unknown", 0.0, 0.0
+    mx = max(scores)
+    mean = sum(scores) / len(scores)
+    if mx >= RAG_SCORE_HIGH:
+        label = "high"
+    elif mx >= RAG_SCORE_LOW:
+        label = "medium"
+    else:
+        label = "low"
+    return label, mx, mean
 
 
 def collection_exists(collection_name: str) -> bool:
@@ -134,8 +177,23 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
+@app.get("/health")
+def health():
+    """For uptime checks, load balancers, and verifying deployment (no API key)."""
+    return {
+        "status": "ok",
+        "service": "local-rag-engine",
+        "api_key_required": bool(RAG_API_KEY),
+        "qdrant": f"{QDRANT_HOST}:{QDRANT_PORT}",
+        "ollama": f"{OLLAMA_HOST}:{OLLAMA_PORT}",
+    }
+
+
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    _: None = Depends(require_api_key),
+):
     start_time = time.time()
     logger.info(f"Upload started for file: {file.filename}")
     
@@ -232,7 +290,10 @@ async def upload_file(file: UploadFile = File(...)):
     
 
 @app.post("/query_stream")
-async def query_rag_stream(req: QueryRequest):
+async def query_rag_stream(
+    req: QueryRequest,
+    _: None = Depends(require_api_key),
+):
     async def generate_stream():
         start_time = time.time()
         logger.info(f"=== Streaming Query started ===")
@@ -291,12 +352,41 @@ async def query_rag_stream(req: QueryRequest):
             yield "data: " + json.dumps({"error": "⚠️ No context found for this question."}) + "\n\n"
             return
 
+        scores: List[float] = []
+        for h in hits:
+            try:
+                scores.append(float(h.score))
+            except (TypeError, ValueError, AttributeError):
+                pass
+        conf_label, max_sim, mean_sim = retrieval_confidence_from_scores(scores)
+
         sources = build_sources(hits)
-        yield "data: " + json.dumps({"sources": sources}) + "\n\n"
+        retrieval_meta = {
+            "confidence": conf_label,
+            "max_similarity": round(max_sim, 4),
+            "mean_similarity": round(mean_sim, 4),
+            "thresholds": {"high_at_least": RAG_SCORE_HIGH, "medium_at_least": RAG_SCORE_LOW},
+            "instructor_note": (
+                "Low retrieval similarity: compare each sentence of the answer to the passages below; "
+                "unsupported claims are likely hallucinations."
+                if conf_label == "low"
+                else "Verify non-obvious claims against the cited passages (similarity scores are approximate)."
+            ),
+        }
+        yield "data: " + json.dumps({"sources": sources, "retrieval": retrieval_meta}) + "\n\n"
 
         context = "\n\n".join([hit.payload["text"] for hit in hits])
+        abstain_rules = (
+            "Rules: Use ONLY the context. If the context is insufficient, unrelated, or ambiguous, say so clearly "
+            "in 2–3 sentences—do not invent citations, numbers, or details. "
+            "If you are uncertain, say you are uncertain. "
+        )
+        if conf_label == "low":
+            abstain_rules += (
+                "Retrieval similarity to this question is LOW; prefer stating that you cannot answer from the given passages. "
+            )
         prompt = (
-            "Answer using only the context below. "
+            f"{abstain_rules}"
             "Respond in exactly 2 or 3 complete sentences. Do not use bullet points or headings.\n\n"
             f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer (2-3 sentences):"
         )
@@ -331,7 +421,9 @@ async def query_rag_stream(req: QueryRequest):
                                     await asyncio.sleep(0.01)  # helps flushing
 
                                 if chunk.get("done"):
-                                    yield "data: " + json.dumps({"done": True, "sources": sources}) + "\n\n"
+                                    yield "data: " + json.dumps(
+                                        {"done": True, "sources": sources, "retrieval": retrieval_meta}
+                                    ) + "\n\n"
                                     break
                             except Exception as e:
                                 logger.error(f"Chunk parse error: {e}")
@@ -351,7 +443,7 @@ async def query_rag_stream(req: QueryRequest):
 
 
 @app.get("/files")
-def list_files():
+def list_files(_: None = Depends(require_api_key)):
     try:
         collections = qdrant.get_collections().collections
         collection_names = [col.name for col in collections]
@@ -373,7 +465,7 @@ def list_files():
         return {"error": f"Qdrant scroll failed: {str(e)}"}
 
 @app.post("/delete_file")
-def delete_file(req: DeleteRequest):
+def delete_file(req: DeleteRequest, _: None = Depends(require_api_key)):
     try:
         # Delete file vectors
         qdrant.delete(

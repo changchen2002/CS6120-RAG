@@ -146,8 +146,27 @@ Once running, access the application through:
 |---------|-----|-------------|
 | 🔗 **Streamlit App** | http://localhost:8501 | Main user interface |
 | 📘 **FastAPI Docs** | http://localhost:8000/docs | API documentation |
+| ❤️ **Health** | http://localhost:8000/health | Liveness JSON (no API key) |
 | 🧠 **Qdrant UI** | http://localhost:6333/dashboard | Vector database dashboard |
 | 🤖 **Ollama API** | http://localhost:11434 | LLM service endpoint |
+
+---
+
+## Evaluation notes (security, accuracy, provenance & methodology)
+
+### Access, performance, and scaling
+- **Public endpoints**: Mapping `8000` / `8501` to the host exposes the UI and API on your machine/LAN. For anything beyond local trust, set **`RAG_API_KEY`** (same value for the FastAPI process and Streamlit). Clients must send header **`X-API-Key`**. **`GET /health`** stays unauthenticated for probes and load balancers.
+- **Reasonable latency**: The slowest steps are usually embedding + Ollama on CPU; see logs for timing. **Scaling path**: run multiple `uvicorn` workers or replicas behind a reverse proxy, use a GPU-backed Ollama host, and keep Qdrant on fast disk or a dedicated node.
+
+### Accuracy and hallucination checks (for instructors / TAs)
+- The **LLM is instructed** to abstain when context is insufficient and to avoid inventing details; this is **not** a guarantee.
+- **Implementation for review**: Each answer shows **retrieval confidence** (`high` / `medium` / `low`) from **Qdrant cosine similarity** scores, plus **per-source `similarity_score`**. Instructors can compare the model’s sentences to the **cited passages** (in expanders) and treat **low similarity** as a red flag for unsupported claims.
+- Tune thresholds with env **`RAG_SCORE_HIGH`** and **`RAG_SCORE_LOW`** (defaults in `app.py`).
+
+### Code and data provenance
+- **Reproducible & containerized**: `Dockerfile` + `docker-compose.yml`, pinned **`requirements.txt`**, fixed embedding model id, and scripts under `scripts/` for download + ingest. Rebuild images for a clean environment.
+- **Modeling methodology (RAG vs. supervised classification)**: This app is **retrieval + generation**, not a classifier trained on labeled classes—so “class imbalance” in the arXiv corpus mainly means **topic frequency skew** in the index. Mitigations already in use: **top‑k cap**, **score-based confidence**, **deterministic dedupe** in `ingest_arxiv.py`, and **citation-first** answers.
+- **PDF path**: Chunks are grouped with **KMeans** for metadata; that is a **heuristic**, not a trained classifier—avoid over-interpreting cluster ids. Mitigation: fixed `random_state`, bounded `k`, and chunking via LangChain splitters to limit overfitting to any single chunk.
 
 ---
 

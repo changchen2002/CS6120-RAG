@@ -8,6 +8,15 @@ import time
 
 # FastAPI base URL (routes are /upload, /files, /query_stream, /delete_file — not under /query_stream)
 API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000").rstrip("/")
+# Must match backend when RAG_API_KEY is set (e.g. in docker-compose for rag-app)
+RAG_API_KEY = os.getenv("RAG_API_KEY", "").strip()
+
+
+def _api_headers(**extra: str) -> dict:
+    h = {**extra}
+    if RAG_API_KEY:
+        h["X-API-Key"] = RAG_API_KEY
+    return h
 
 # Retrieved passage preview length in Sources expander (do not print full text on the main page)
 _SOURCES_PREVIEW_MAX_WORDS = 300
@@ -43,6 +52,8 @@ if "stream_complete" not in st.session_state:
     st.session_state.stream_complete = False
 if "final_sources" not in st.session_state:
     st.session_state.final_sources = []
+if "retrieval_info" not in st.session_state:
+    st.session_state.retrieval_info = None
 
 st.title("📚 Your AI File Assistant : Upload, Ask, Learn")
 st.write(
@@ -71,7 +82,7 @@ if uploaded_files:
         with st.spinner(f"Processing {f.name}..."):
             files = {"file": (f.name, f, "application/pdf")}
             try:
-                res = requests.post(f"{API_URL}/upload", files=files)
+                res = requests.post(f"{API_URL}/upload", files=files, headers=_api_headers())
                 if res.status_code == 200:
                     st.success(res.json().get("status", "✅ Uploaded!"))
                     st.session_state.uploaded_files.append(f.name)
@@ -88,7 +99,7 @@ if uploaded_files:
 st.header("2️⃣ Choose PDF(s) to search")
 
 try:
-    files_res = requests.get(f"{API_URL}/files")
+    files_res = requests.get(f"{API_URL}/files", headers=_api_headers())
     if files_res.status_code == 200:
         file_list = files_res.json().get("files", [])
     else:
@@ -149,6 +160,7 @@ if get_answer:
         st.session_state.streaming_answer = ""
         st.session_state.final_answer = ""
         st.session_state.final_sources = []
+        st.session_state.retrieval_info = None
         st.session_state.is_processing = True
         st.session_state.pending_question = question
         st.session_state.pending_files = selected_files
@@ -178,10 +190,18 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
                     f"{API_URL}/query_stream",
                     json=payload,
                     stream=True,
-                    headers={'Accept': 'text/plain'},
+                    headers=_api_headers(Accept="text/plain"),
                     timeout=600,
                 ) as response:
-                    if response.status_code == 200:
+                    if response.status_code == 401:
+                        st.session_state.final_answer = (
+                            "API returned 401: set the same RAG_API_KEY in the environment for the FastAPI "
+                            "service and this Streamlit app (see README)."
+                        )
+                        st.session_state.stream_complete = True
+                        st.session_state.is_processing = False
+                        answer_placeholder.error(st.session_state.final_answer)
+                    elif response.status_code == 200:
                         for line in response.iter_lines(chunk_size=1, decode_unicode=True):
                             if line.startswith("data: "):
                                 try:
@@ -196,12 +216,16 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
                                         st.session_state.final_answer = st.session_state.streaming_answer
                                         if "sources" in data:
                                             st.session_state.final_sources = data["sources"]
+                                        if "retrieval" in data:
+                                            st.session_state.retrieval_info = data["retrieval"]
                                         st.session_state.stream_complete = True
                                         st.session_state.is_processing = False
                                         st.rerun()  # Rerun to update UI
                                         break
                                     elif "sources" in data:
                                         st.session_state.final_sources = data["sources"]
+                                        if "retrieval" in data:
+                                            st.session_state.retrieval_info = data["retrieval"]
                                         status_hint.info(
                                             "📎 **Context retrieved.** Waiting for the model to emit the first "
                                             "tokens — on a CPU-bound Ollama setup this can take **well over a minute**."
@@ -229,18 +253,38 @@ if st.session_state.is_processing or st.session_state.get('final_answer', ''):
     else:
         # Show completed answer (persists across reruns)
         if st.session_state.get('final_answer', ''):
-            if st.session_state.final_answer.startswith(("Query failed:", "API request failed:")):
-                answer_placeholder.error(st.session_state.final_answer)
+            fa = st.session_state.final_answer
+            if fa.startswith(("Query failed:", "API request failed:", "API returned 401")):
+                answer_placeholder.error(fa)
             else:
                 answer_placeholder.markdown(st.session_state.final_answer)
+                ri = st.session_state.get("retrieval_info")
+                if ri:
+                    conf = ri.get("confidence", "?")
+                    mx = ri.get("max_similarity")
+                    mn = ri.get("mean_similarity")
+                    note = ri.get("instructor_note", "")
+                    if conf == "low":
+                        st.warning(
+                            f"**Retrieval confidence: {conf}** (max similarity ≈ {mx}, mean ≈ {mn}). "
+                            f"{note}"
+                        )
+                    else:
+                        st.info(
+                            f"**Retrieval confidence: {conf}** — max similarity ≈ {mx}, mean ≈ {mn}. "
+                            f"{note}"
+                        )
                 sources = st.session_state.get("final_sources", [])
                 if sources:
-                    st.markdown("### Sources")
+                    st.markdown("### Sources (for instructor/TA verification)")
                     for i, s in enumerate(sources):
                         title = s.get("title", "Untitled")
                         url = (s.get("url") or "").strip()
                         passage = (s.get("passage") or "").strip()
+                        sim = s.get("similarity_score")
                         idx = i + 1
+                        if sim is not None:
+                            st.caption(f"Qdrant cosine similarity: {sim}")
                         if url:
                             safe_href = html.escape(url, quote=True)
                             safe_title = html.escape(title)
@@ -271,7 +315,11 @@ if selected_files:
         )
         if confirm == "Yes, delete them":
             try:
-                res = requests.post(f"{API_URL}/delete_file", json={"filenames": selected_files})
+                res = requests.post(
+                    f"{API_URL}/delete_file",
+                    json={"filenames": selected_files},
+                    headers=_api_headers(),
+                )
                 if res.status_code == 200:
                     st.success(res.json().get("status", "Deleted!"))
                     st.session_state.uploaded_files = [

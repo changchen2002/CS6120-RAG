@@ -37,16 +37,13 @@ services:
       - ollama
     command: >
       sh -c "
-      (
-        if [ ! -d data/arxiv_raw ] || [ \"$(find data/arxiv_raw -type f | wc -l)\" -eq 0 ]; then
-          echo 'Raw data missing or empty, running download_data.py'
-          python scripts/download_data.py
-        else
-          echo 'Raw data already exists, skipping download_data.py'
-        fi
-        python scripts/ingest_arxiv.py data/arxiv-dataset.json
-      ) &
       uvicorn app:app --host 0.0.0.0 --port 8000 &
+      (
+        # Let the API/UI come up first, then download + ingest in the background.
+        sleep 2
+        python scripts/download_data.py
+        python scripts/ingest_arxiv.py data/arxiv_raw
+      ) &
       streamlit run ui.py --server.port 8501 --server.address 0.0.0.0
       "
     environment:
@@ -58,12 +55,12 @@ services:
       # - RAG_API_KEY=change-me
       # - RAG_SCORE_HIGH=0.48
       # - RAG_SCORE_LOW=0.30
-      - ARXIV_RAW_URL=
       - ARXIV_HF_REPO=permutans/arxiv-papers-by-subject
-      - ARXIV_DATASET_PATH=data/arxiv-dataset.json
-      - ARXIV_SAMPLE_SIZE=10000
+      - ARXIV_RAW_DIR=data/arxiv_raw
     volumes:
       - ./hf_cache:/app/.cache/huggingface
+      # Mount host data directory so manual downloads are visible in-container.
+      - ./data:/app/data
 
 volumes:
   qdrant_data:

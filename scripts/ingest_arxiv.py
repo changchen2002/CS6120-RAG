@@ -18,27 +18,26 @@ COLLECTION_NAME = "arxiv_abstracts"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 # Deterministic UUID namespace for Qdrant point ids (same arXiv paper → same id → upsert overwrites)
 ARXIV_QDRANT_POINT_NS = uuid.UUID("a3e84c61-4f2b-4c6e-8b1d-0f2a7e9c4d11")
-DEFAULT_LIMIT = 10_000
 DEFAULT_BATCH_SIZE = 128
-DEFAULT_SAMPLE_PATH = os.getenv("ARXIV_DATASET_PATH", "data/arxiv-dataset.json")
 DEFAULT_RAW_DIR = os.getenv("ARXIV_RAW_DIR", "data/arxiv_raw")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Ingest the first 10k arXiv abstracts into Qdrant."
+        description="Ingest arXiv abstracts into Qdrant from a directory or file."
     )
     parser.add_argument(
-        "dataset",
+        "source",
         nargs="?",
-        default=os.getenv("ARXIV_DATASET_PATH", DEFAULT_SAMPLE_PATH),
-        help="Path to the sampled arXiv dataset file (.json, .jsonl, .csv, optionally .gz).",
+        default=None,
+        help="Optional path to a dataset directory or file (.parquet/.json/.jsonl/.csv, optionally .gz). "
+        "If omitted, uses --raw-dir.",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=DEFAULT_LIMIT,
-        help="Maximum number of papers to ingest.",
+        default=None,
+        help="Maximum number of papers to ingest. If omitted, ingests all records found.",
     )
     parser.add_argument(
         "--batch-size",
@@ -239,8 +238,14 @@ def is_data_dir_populated(directory):
     return False
 
 
-def load_documents(path, limit):
-    """Deduplicate by _point_key so the same paper is not embedded twice (e.g. overlapping files)."""
+def load_documents(path, limit: int | None, skip_point_ids: set[str] | None = None):
+    """
+    Load documents for ingestion.
+
+    - Deduplicate by _point_key so the same paper is not embedded twice (e.g. overlapping files).
+    - If `skip_point_ids` is provided, records whose deterministic Qdrant point id already exists
+      are skipped (incremental ingest).
+    """
     if os.path.isdir(path):
         record_iter = iter_directory_records(path)
     else:
@@ -254,8 +259,12 @@ def load_documents(path, limit):
         key = record["_point_key"]
         if key in by_key:
             continue
+        if skip_point_ids is not None:
+            pid = point_id_from_key(key)
+            if pid in skip_point_ids:
+                continue
         by_key[key] = record
-        if len(by_key) >= limit:
+        if limit is not None and len(by_key) >= limit:
             break
     return list(by_key.values())
 
@@ -286,7 +295,6 @@ def reset_collection(client, vector_size):
 
 def main():
     args = parse_args()
-    dataset_path = args.dataset
     raw_dir = args.raw_dir
 
     qdrant_host = os.getenv("QDRANT_HOST", "localhost")
@@ -297,27 +305,52 @@ def main():
     if collection_exists_flag:
         existing_count = get_collection_count(client, COLLECTION_NAME)
         print(f"Collection '{COLLECTION_NAME}' already exists with {existing_count} entries.")
-        if existing_count >= args.limit:
-            print(f"Database already has {existing_count} entries, skipping ingestion.")
-            return
     else:
         existing_count = 0
 
-    if dataset_path and os.path.exists(dataset_path):
-        source_path = dataset_path
-        print(f"📄 Using sample dataset file: {source_path}")
+    source_path = args.source or raw_dir
+    if os.path.isdir(source_path):
+        if not is_data_dir_populated(source_path):
+            raise SystemExit(
+                f"No supported files found in directory: {source_path}. "
+                "Run download_data.py first or provide a different source path."
+            )
+        print(f"📁 Using dataset directory: {source_path}")
+    elif os.path.exists(source_path):
+        print(f"📄 Using dataset file: {source_path}")
     elif is_data_dir_populated(raw_dir):
         source_path = raw_dir
         print(f"📁 Using raw dataset directory: {source_path}")
     else:
         raise SystemExit(
-            f"Dataset not found: {dataset_path}. "
+            f"Source path not found: {source_path}. "
             f"No supported files found in raw dir: {raw_dir}. "
-            "Run download_data.py first or provide a dataset path."
+            "Run download_data.py first or provide a valid source path."
         )
 
-    documents = load_documents(source_path, args.limit)
+    # Incremental ingest: skip records already present in Qdrant (deterministic UUIDv5 ids).
+    existing_point_ids: set[str] | None = None
+    if collection_exists_flag:
+        existing_point_ids = set()
+        next_page = None
+        while True:
+            points, next_page = client.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=2048,
+                offset=next_page,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for p in points:
+                existing_point_ids.add(str(p.id))
+            if next_page is None:
+                break
+
+    documents = load_documents(source_path, args.limit, skip_point_ids=existing_point_ids)
     if not documents:
+        if collection_exists_flag:
+            print("No new records found to ingest (all candidates already exist in Qdrant).")
+            return
         raise SystemExit("No valid records found in dataset.")
 
     model = SentenceTransformer(EMBEDDING_MODEL)
@@ -329,7 +362,7 @@ def main():
     if not collection_exists_flag:
         reset_collection(client, dim)
     else:
-        print(f"Appending documents to existing collection '{COLLECTION_NAME}'.")
+        print(f"Appending new documents to existing collection '{COLLECTION_NAME}'.")
 
     def payload_only(doc: dict) -> dict:
         return {k: v for k, v in doc.items() if k != "_point_key"}
